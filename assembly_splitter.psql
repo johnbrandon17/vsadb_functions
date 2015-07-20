@@ -1,0 +1,161 @@
+@@ -0,0 +1,160 @@
+/*
+Creates a function of bondstrength called splitter that deletes bonds if their bondstrength is lower than theinput of
+the function.
+
+Then determines if events are still bonded to other events in the same assembly.
+
+Then moves events that are not bonded to other events into a new assemblyid of their own.
+*/
+
+CREATE OR REPLACE FUNCTION splitter(min_strength real) RETURNS BOOLEAN AS $$
+BEGIN
+
+--
+--deletes bonds that are too weak
+--
+DELETE FROM bond
+WHERE bondstrength < min_strength
+;
+
+--
+--creates temporary table to store eventids, new assemblyids, and the old assemblyids
+--of events that are no longer bonded in the assembly
+--
+CREATE TEMPORARY TABLE reject
+(eventid bigint, new_id bigint, old_id bigint)
+ON COMMIT DROP
+;
+
+--
+--select all events but one from assemblies with no bonds
+--
+WITH empty AS
+(
+	SELECT eventid, new_assemblyid, old_assemblyid
+	FROM
+		(
+			SELECT nextval('assembly_assemblyid_seq') AS new_assemblyid,
+			nextval('assembly_points_assemblyid_seq'), eventid,				--both sequences are called to insure that they do not diverge from each other
+			events.assemblyid AS old_assemblyid	
+			FROM 
+				(
+				SELECT eventid, assemblyid,
+				rank () OVER (PARTITION BY assemblyid ORDER BY eventid) AS pos --ranks the events of each assembly by their eventid number
+				FROM assembly_points
+				) AS events
+			LEFT OUTER JOIN --Insures that every row of events is in the total table, tuu. 
+							--Allows for NULL values in total_bonds
+				(
+				SELECT assemblyid, ST_Multi(ST_Union("bondLine")) AS multi 	--creates multilinestrings of all the bonds in each assembly
+				FROM bond GROUP BY assemblyid
+				) AS total_bonds
+			ON (total_bonds.assemblyid = events.assemblyid)
+			WHERE total_bonds.multi IS NULL				-- selects only assemblies with no bonds
+			AND events.pos>1			-- If there are multiple events in an empty assembly, all but one events are chosen. Therefore, 
+										-- leaving one event in the assembly. Thus no need to delete the assemblyid from any table
+		)
+	AS tuu
+)
+INSERT INTO reject (eventid, new_id, old_id)
+SELECT eventid, new_assemblyid, old_assemblyid FROM empty
+;
+
+--
+--selects events that are not from the L3 Trigger from assemblies that
+--still have bonds
+--
+WITH incomplete AS
+(
+SELECT eventid, nextval('assembly_assemblyid_seq') AS new_assemblyid, nextval('assembly_points_assemblyid_seq'),
+points.assemblyid AS old_assemblyid
+FROM 
+	(
+	SELECT * FROM assembly_points
+	WHERE CASE coordinate WHEN ST_GeomFromText('POINT(1 1)', 4326) THEN FALSE ELSE TRUE END --Selects for events that are not trigger points
+	) AS points
+	JOIN --total table will only consist of rows where there are matches in both the total_bonds and points tables
+		 --Thus, only assemblies with bonds will be included in this table
+	(
+	SELECT assemblyid, ST_Multi(ST_Union("bondLine")) AS multi
+	FROM bond GROUP BY assemblyid
+	) AS total_bonds
+	ON ST_Disjoint(points.coordinate, total_bonds.multi) --the point associated with the event do not spatially intersect the multilinestring of the bonds in that assembly
+														 --ST_Disjoint returns NULL if one of the input geometries is NULL
+	AND points.assemblyid = total_bonds.assemblyid
+)
+INSERT INTO reject(eventid, new_id, old_id)
+SELECT eventid, new_assemblyid, old_assemblyid FROM incomplete
+;
+
+--
+--selects for trigger points that are not bonded to telescopes and that are in assemblies with bonds
+--
+
+WITH other AS
+(
+SELECT eventid, points.assemblyid AS old_assemblyid,
+nextval('assembly_points_assemblyid_seq'), nextval('assembly_assemblyid_seq') AS new_assemblyid
+FROM
+	(
+	SELECT * FROM assembly_points WHERE coordinate = ST_GeomFromText('POINT(1 1)', 4326) --selects for all events that are associated with the L3 trigger
+	) AS points
+	JOIN
+	(
+	SELECT tele_bonds.assemblyid, total_multi, trigger_multi FROM
+		(
+		SELECT assemblyid, ST_Multi(ST_Union("bondLine")) AS total_multi --creates multilinestring of all bonds in assembly
+		FROM bond
+		GROUP BY assemblyid
+		) AS tele_bonds
+	LEFT OUTER JOIN --Insures that all assemblies where total_multi is not NULL are included in the table, but allows a null value of trig_bonds.
+					--Thus there are no assemblies with no bonds included in this table
+		(
+		SELECT assemblyid, ST_Multi(ST_Union("bondLine")) AS trigger_multi	--multilinestring of all bonds that involve the trigger
+		FROM bond
+		WHERE bondtype = 2 		--bondtype = 2 is true only for bonds that involve the trigger
+		GROUP BY assemblyid
+		) AS trig_bonds
+	ON tele_bonds.assemblyid = trig_bonds.assemblyid
+	WHERE trigger_multi IS	NULL --If trigger_multi is NULL, then there are no bonds involving the trigger
+	) AS all_bonds
+	ON all_bonds.assemblyid = points.assemblyid
+)
+INSERT INTO reject (eventid, new_id, old_id)
+SELECT eventid, new_assemblyid, old_assemblyid FROM other
+;
+
+
+--
+--"first" updates assemblystate to FALSE for assemblies that have events to be removed from them
+--
+--"next" updates assemblid's of events to new values in assembly_points table
+--
+--inserts the new assemblid's into assembly table
+--
+WITH first AS
+(
+UPDATE assembly SET assemblystate = FALSE FROM reject
+WHERE assembly.assemblyid = reject.old_id
+),	
+next AS 
+(
+UPDATE assembly_points SET assemblyid = reject.new_id
+FROM reject
+WHERE assembly_points.eventid = reject.eventid
+AND assembly_points.assemblyid = reject.old_id --insures that the assemblyid has not already been changed
+RETURNING new_id
+)
+INSERT INTO assembly 
+SELECT * FROM next
+;
+
+
+--
+--returns whether any changes are made
+--
+RETURN FOUND;
+
+END;
+$$ LANGUAGE plpgsql;
+	
